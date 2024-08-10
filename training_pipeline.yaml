@@ -1,0 +1,162 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: clickbait-detection-training-pipeline-
+  annotations: {pipelines.kubeflow.org/kfp_sdk_version: 1.8.0, pipelines.kubeflow.org/pipeline_compilation_time: '2024-08-09T20:38:27.128041',
+    pipelines.kubeflow.org/pipeline_spec: '{"description": "A pipeline that performs
+      full E2E ML workflow, from data ingestion to model training", "name": "Clickbait
+      Detection Training Pipeline"}'}
+  labels: {pipelines.kubeflow.org/kfp_sdk_version: 1.8.0}
+spec:
+  entrypoint: clickbait-detection-training-pipeline
+  templates:
+  - name: cleanse-data
+    container:
+      args: [cd kedro/clickbait-detector-kedro && kedro run -p data_cleansing --params
+          intermediate_path=/mnt/data/]
+      command: [sh, -c]
+      image: julionevadod/clickbait-detector-kubeflow:dev
+      volumeMounts:
+      - {mountPath: /mnt, name: create-pvc}
+      imagePullPolicy: Always
+    inputs:
+      parameters:
+      - {name: create-pvc-name}
+    metadata:
+      labels:
+        pipelines.kubeflow.org/kfp_sdk_version: 1.8.0
+        pipelines.kubeflow.org/pipeline-sdk-type: kfp
+        pipelines.kubeflow.org/enable_caching: "true"
+    volumes:
+    - name: create-pvc
+      persistentVolumeClaim: {claimName: '{{inputs.parameters.create-pvc-name}}'}
+  - name: clickbait-detection-training-pipeline
+    dag:
+      tasks:
+      - name: cleanse-data
+        template: cleanse-data
+        dependencies: [create-pvc, read-data]
+        arguments:
+          parameters:
+          - {name: create-pvc-name, value: '{{tasks.create-pvc.outputs.parameters.create-pvc-name}}'}
+      - {name: create-pvc, template: create-pvc}
+      - name: read-data
+        template: read-data
+        dependencies: [create-pvc]
+        arguments:
+          parameters:
+          - {name: create-pvc-name, value: '{{tasks.create-pvc.outputs.parameters.create-pvc-name}}'}
+      - name: train-clickbait-detector
+        template: train-clickbait-detector
+        dependencies: [cleanse-data]
+  - name: create-pvc
+    resource:
+      action: create
+      manifest: |
+        apiVersion: v1
+        kind: PersistentVolumeClaim
+        metadata:
+          name: '{{workflow.name}}-training-pipeline-pvc'
+        spec:
+          accessModes:
+          - ReadWriteOnce
+          resources:
+            requests:
+              storage: 1Gi
+    outputs:
+      parameters:
+      - name: create-pvc-manifest
+        valueFrom: {jsonPath: '{}'}
+      - name: create-pvc-name
+        valueFrom: {jsonPath: '{.metadata.name}'}
+      - name: create-pvc-size
+        valueFrom: {jsonPath: '{.status.capacity.storage}'}
+    metadata:
+      labels:
+        pipelines.kubeflow.org/kfp_sdk_version: 1.8.0
+        pipelines.kubeflow.org/pipeline-sdk-type: kfp
+        pipelines.kubeflow.org/enable_caching: "true"
+  - name: read-data
+    container:
+      args: ['cd kedro/clickbait-detector-kedro && kedro run -p data_loading --params
+          input_data_location=https://ml-coding-test.s3.eu-west-1.amazonaws.com/webis_train.csv,intermediate_path=/mnt/data/']
+      command: [sh, -c]
+      image: julionevadod/clickbait-detector-kubeflow:dev
+      volumeMounts:
+      - {mountPath: /mnt, name: create-pvc}
+      imagePullPolicy: Always
+    inputs:
+      parameters:
+      - {name: create-pvc-name}
+    metadata:
+      labels:
+        pipelines.kubeflow.org/kfp_sdk_version: 1.8.0
+        pipelines.kubeflow.org/pipeline-sdk-type: kfp
+        pipelines.kubeflow.org/enable_caching: "true"
+    volumes:
+    - name: create-pvc
+      persistentVolumeClaim: {claimName: '{{inputs.parameters.create-pvc-name}}'}
+  - name: train-clickbait-detector
+    resource:
+      action: apply
+      manifest: |
+        apiVersion: kubeflow.org/v1
+        kind: PyTorchJob
+        metadata:
+          name: pytorch-dist-clickbait-gloo
+          namespace: kubeflow
+        spec:
+          pytorchReplicaSpecs:
+            Master:
+              replicas: 1
+              restartPolicy: OnFailure
+              template:
+                spec:
+                  containers:
+                  - command:
+                    - torchrun
+                    - training/train.py
+                    image: julionevadod/clickbait-detector-kubeflow:dev
+                    name: pytorch
+                    volumeMounts:
+                    - mountPath: /mnt
+                      name: create-pvc
+                  volumes:
+                  - name: create-pvc
+                    persistentVolumeClaim:
+                      claimName: clickbait-detection-training-pipeline-cvtvx-training-pipeline-pvc
+            Worker:
+              replicas: 1
+              restartPolicy: OnFailure
+              template:
+                metadata:
+                  annotations:
+                    sidecar.istio.io/inject: 'false'
+                spec:
+                  containers:
+                  - command:
+                    - torchrun
+                    - training/train.py
+                    image: julionevadod/clickbait-detector-kubeflow:dev
+                    name: pytorch
+                    volumeMounts:
+                    - mountPath: /mnt
+                      name: create-pvc
+                  volumes:
+                  - name: create-pvc
+                    persistentVolumeClaim:
+                      claimName: clickbait-detection-training-pipeline-cvtvx-training-pipeline-pvc
+    outputs:
+      parameters:
+      - name: train-clickbait-detector-manifest
+        valueFrom: {jsonPath: '{}'}
+      - name: train-clickbait-detector-name
+        valueFrom: {jsonPath: '{.metadata.name}'}
+    metadata:
+      labels:
+        pipelines.kubeflow.org/kfp_sdk_version: 1.8.0
+        pipelines.kubeflow.org/pipeline-sdk-type: kfp
+        pipelines.kubeflow.org/enable_caching: "true"
+  arguments:
+    parameters: []
+  serviceAccountName: pipeline-runner
